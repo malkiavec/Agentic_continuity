@@ -274,6 +274,17 @@ def render_continuity_page(df_raw: pd.DataFrame) -> None:
     ax.set_ylabel("Continuity Score")
     ax.set_title("Continuity Score (higher = more likely regime shift)")
     st.pyplot(fig)
+    
+    # Download Chart 1
+    import io
+    img1 = io.BytesIO()
+    fig.savefig(img1, format='png')
+    st.download_button(
+        label="Download Continuity Score Chart",
+        data=img1.getvalue(),
+        file_name="continuity_score.png",
+        mime="image/png"
+    )
 
     # Plot z-score with break markers
     st.subheader("Regime breaks (z-score)")
@@ -287,6 +298,16 @@ def render_continuity_page(df_raw: pd.DataFrame) -> None:
     ax2.set_ylabel("Continuity Z-score")
     ax2.set_title("Continuity Z-score with break threshold")
     st.pyplot(fig2)
+
+    # Download Chart 2
+    img2 = io.BytesIO()
+    fig2.savefig(img2, format='png')
+    st.download_button(
+        label="Download Regime Breaks Chart",
+        data=img2.getvalue(),
+        file_name="regime_breaks.png",
+        mime="image/png"
+    )
 
     # Break table
     st.subheader("Detected breakpoints")
