@@ -1,0 +1,328 @@
+1) Add these functions to continuity_page.py (paste below your continuity-score functions)
+# ----------------------------
+# Continuity state machine + regime labeling + logging
+# ----------------------------
+
+STATE_STABLE = "STABLE"
+STATE_DRIFT = "DRIFT"
+STATE_BREAK = "BREAK"
+STATE_SHOCK = "SHOCK"
+STATE_RECOVERY = "RECOVERY"
+
+def classify_level(z: float, z_low=1.5, z_break=3.0, z_shock=6.0) -> str:
+    if pd.isna(z):
+        return "UNKNOWN"
+    if z >= z_shock:
+        return STATE_SHOCK
+    if z >= z_break:
+        return STATE_BREAK
+    if z >= z_low:
+        return STATE_DRIFT
+    return STATE_STABLE
+
+def assign_fsm_state(df_out: pd.DataFrame, z_low=1.5, z_break=3.0, z_shock=6.0, r_recovery=3) -> pd.DataFrame:
+    """
+    Adds:
+      - regime_level  (STABLE/DRIFT/BREAK/SHOCK)
+      - continuity_state (STABLE/DRIFT/BREAK/SHOCK/RECOVERY)
+    """
+    df = df_out.copy()
+    df["regime_level"] = df["continuity_z"].apply(lambda z: classify_level(z, z_low, z_break, z_shock))
+
+    state = STATE_STABLE
+    recovery_ok = 0
+    states = []
+
+    for lvl in df["regime_level"].tolist():
+        if lvl in (STATE_BREAK, STATE_SHOCK):
+            state = lvl
+            recovery_ok = 0
+            states.append(state)
+            continue
+
+        if state in (STATE_BREAK, STATE_SHOCK):
+            state = STATE_RECOVERY
+            recovery_ok = 0
+
+        if state == STATE_RECOVERY:
+            if lvl == STATE_STABLE:
+                recovery_ok += 1
+                if recovery_ok >= r_recovery:
+                    state = STATE_STABLE
+            else:
+                recovery_ok = 0
+
+        elif state == STATE_STABLE:
+            if lvl == STATE_DRIFT:
+                state = STATE_DRIFT
+
+        elif state == STATE_DRIFT:
+            if lvl == STATE_STABLE:
+                state = STATE_STABLE
+
+        states.append(state)
+
+    df["continuity_state"] = states
+    return df
+
+def add_regime_id(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Regime id increments on each break event (first TRUE of a run),
+    using regime_break OR SHOCK.
+    """
+    df = df_out.copy()
+    shock = df.get("regime_level", pd.Series([""] * len(df))).eq(STATE_SHOCK)
+    br = df["regime_break"].fillna(False).astype(bool) | shock
+
+    break_event = br & (~br.shift(1).fillna(False))
+    df["break_event"] = break_event
+
+    # Regime 1 before first break event
+    df["regime_id"] = break_event.cumsum() + 1
+    return df
+
+def build_transition_log(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Logs only when continuity_state changes.
+    Includes dates and key metrics.
+    """
+    cols = ["draw_date", "continuity_state", "continuity_z", "continuity_score", "regime_id"]
+    x = df_out[cols].copy()
+
+    x["prev_state"] = x["continuity_state"].shift(1)
+    x["prev_date"] = x["draw_date"].shift(1)
+    x["state_changed"] = (x["continuity_state"] != x["prev_state"]) & x["prev_state"].notna()
+
+    log = x[x["state_changed"]].copy()
+    log.rename(columns={"continuity_state": "new_state"}, inplace=True)
+    log["transition"] = log["prev_state"] + " → " + log["new_state"]
+
+    # Keep and order columns
+    log = log[[
+        "prev_date", "draw_date", "regime_id",
+        "prev_state", "new_state", "transition",
+        "continuity_score", "continuity_z"
+    ]].reset_index(drop=True)
+    return log
+
+def build_break_explanations(df_out: pd.DataFrame, window: int) -> pd.DataFrame:
+    """
+    For each break_event, compare mean metrics in the window BEFORE vs AFTER the break.
+    Produces one row per metric per break date (tidy table).
+    """
+    metrics = [
+        "sum", "range", "gap_std", "gap_max", "consec_pairs",
+        "overlap_prev", "delta_mean_abs", "delta_max_abs",
+        "delta_pos", "delta_neg", "odd", "low"
+    ]
+    metrics = [m for m in metrics if m in df_out.columns]
+
+    rows = []
+    idxs = df_out.index[df_out["break_event"] == True].tolist()
+
+    for i in idxs:
+        # define windows
+        start_before = i - window
+        end_before = i - 1
+        start_after = i
+        end_after = i + window - 1
+
+        if start_before < 0 or end_after >= len(df_out):
+            # skip edges (not enough context)
+            continue
+
+        before = df_out.loc[start_before:end_before, metrics].astype(float)
+        after = df_out.loc[start_after:end_after, metrics].astype(float)
+
+        before_mean = before.mean(numeric_only=True)
+        after_mean = after.mean(numeric_only=True)
+        delta = after_mean - before_mean
+
+        for m in metrics:
+            b = float(before_mean[m])
+            a = float(after_mean[m])
+            d = float(delta[m])
+            pct = (d / b * 100.0) if (b != 0 and not np.isnan(b)) else np.nan
+
+            rows.append({
+                "break_date": df_out.loc[i, "draw_date"],
+                "regime_id": int(df_out.loc[i, "regime_id"]),
+                "metric": m,
+                "before_mean": b,
+                "after_mean": a,
+                "delta": d,
+                "pct_change": pct,
+                "continuity_z": float(df_out.loc[i, "continuity_z"]) if not pd.isna(df_out.loc[i, "continuity_z"]) else np.nan,
+                "state_at_break": df_out.loc[i, "continuity_state"]
+            })
+
+    return pd.DataFrame(rows)
+2) Update SQLite schema in init_db() (add tables + new columns)
+Replace your current init_db() with this version (it preserves your existing tables and adds what we need):
+
+def init_db(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+
+    # Draws table (unchanged)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS draws (
+            draw_date TEXT PRIMARY KEY,
+            num1 INTEGER, num2 INTEGER, num3 INTEGER, num4 INTEGER, num5 INTEGER, num6 INTEGER,
+            bonus INTEGER
+        )
+    """)
+
+    # Continuity table: add continuity_state + regime_id
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS continuity (
+            draw_date TEXT PRIMARY KEY,
+            sum INTEGER,
+            range INTEGER,
+            gap_mean REAL,
+            gap_std REAL,
+            gap_max INTEGER,
+            consec_pairs INTEGER,
+            odd INTEGER,
+            even INTEGER,
+            low INTEGER,
+            high INTEGER,
+            overlap_prev REAL,
+            delta_mean_abs REAL,
+            delta_max_abs REAL,
+            delta_neg REAL,
+            delta_zero REAL,
+            delta_pos REAL,
+            continuity_score REAL,
+            continuity_z REAL,
+            regime_break INTEGER,
+            continuity_state TEXT,
+            regime_id INTEGER
+        )
+    """)
+
+    # Transition log table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS state_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prev_date TEXT,
+            date TEXT,
+            regime_id INTEGER,
+            prev_state TEXT,
+            new_state TEXT,
+            transition TEXT,
+            continuity_score REAL,
+            continuity_z REAL
+        )
+    """)
+
+    # Break explanation table (tidy)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS break_explanations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            break_date TEXT,
+            regime_id INTEGER,
+            metric TEXT,
+            before_mean REAL,
+            after_mean REAL,
+            delta REAL,
+            pct_change REAL,
+            continuity_z REAL,
+            state_at_break TEXT
+        )
+    """)
+
+    conn.commit()
+3) Update upsert_continuity() to store continuity_state + regime_id
+Replace your insert_cols list inside upsert_continuity() with this (only change is adding two fields at the end):
+insert_cols = [
+    "draw_date","sum","range","gap_mean","gap_std","gap_max","consec_pairs",
+    "odd","even","low","high",
+    "overlap_prev","delta_mean_abs","delta_max_abs","delta_neg","delta_zero","delta_pos",
+    "continuity_score","continuity_z","regime_break",
+    "continuity_state","regime_id"
+]
+…and before executing, ensure types:
+df_out["continuity_state"] = df_out["continuity_state"].astype(str)
+df_out["regime_id"] = df_out["regime_id"].astype(int)
+Also update the SQL update clause to include these two fields:
+continuity_state=excluded.continuity_state,
+regime_id=excluded.regime_id
+4) Add two new persistence helpers (paste near your SQLite functions
+def write_transition_log(conn: sqlite3.Connection, log_df: pd.DataFrame) -> None:
+    if log_df.empty:
+        return
+    cur = conn.cursor()
+    # normalize dates to string
+    x = log_df.copy()
+    x["prev_date"] = pd.to_datetime(x["prev_date"]).dt.strftime("%Y-%m-%d")
+    x["draw_date"] = pd.to_datetime(x["draw_date"]).dt.strftime("%Y-%m-%d")
+
+    cur.executemany("""
+        INSERT INTO state_transitions
+        (prev_date, date, regime_id, prev_state, new_state, transition, continuity_score, continuity_z)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, x[["prev_date","draw_date","regime_id","prev_state","new_state","transition","continuity_score","continuity_z"]].values.tolist())
+    conn.commit()
+
+def write_break_explanations(conn: sqlite3.Connection, expl_df: pd.DataFrame) -> None:
+    if expl_df.empty:
+        return
+    cur = conn.cursor()
+    x = expl_df.copy()
+    x["break_date"] = pd.to_datetime(x["break_date"]).dt.strftime("%Y-%m-%d")
+
+    cur.executemany("""
+        INSERT INTO break_explanations
+        (break_date, regime_id, metric, before_mean, after_mean, delta, pct_change, continuity_z, state_at_break)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, x[["break_date","regime_id","metric","before_mean","after_mean","delta","pct_change","continuity_z","state_at_break"]].values.tolist())
+    conn.commit()
+5) Modify render_continuity_page() to compute state + regime_id + logs + explanations + display
+Inside render_continuity_page(), right after you create df_out
+df_out = pd.concat([df, feat_df, score_df], axis=1)
+
+# ---- NEW: FSM + regime ids + logs + explanations ----
+z_low = 1.5
+z_break = z_threshold          # keep your slider as the break threshold
+z_shock = 6.0                  # fixed "shock" definition (can be a slider later)
+r_recovery = 3
+
+df_out = assign_fsm_state(df_out, z_low=z_low, z_break=z_break, z_shock=z_shock, r_recovery=r_recovery)
+df_out = add_regime_id(df_out)
+
+transition_log = build_transition_log(df_out)
+break_expl = build_break_explanations(df_out, window=window)
+Display (add near the top of the page, after settings)
+st.subheader("Current continuity mode")
+st.write(f"Current state: **{df_out.iloc[-1]['continuity_state']}**")
+st.write(f"Current regime_id: **{int(df_out.iloc[-1]['regime_id'])}**")
+Display transition log
+st.subheader("State transition log")
+st.dataframe(transition_log.tail(30), use_container_width=True)
+Display break explanation table
+st.subheader("Break explanations (what changed)")
+if break_expl.empty:
+    st.info("No break explanations available (need enough data before/after breaks for the chosen window).")
+else:
+    # Let user choose a break date
+    available_dates = break_expl["break_date"].drop_duplicates().sort_values()
+    chosen = st.selectbox("Select break date", available_dates.astype(str).tolist(), index=len(available_dates)-1)
+    view = break_expl[break_expl["break_date"].astype(str) == str(chosen)].copy()
+
+    # show largest changes first
+    view = view.sort_values("pct_change", ascending=False, key=lambda s: s.abs() if s.notna().any() else s)
+
+    st.dataframe(view, use_container_width=True)
+Persist the new artifacts (inside your existing if persist: block)
+Replace the persistence block with:
+if persist:
+    conn = sqlite3.connect(db_path)
+    init_db(conn)
+    upsert_draws(conn, df_out[["draw_date"] + cols7])
+    upsert_continuity(conn, df_out[["draw_date"] + feat_df.columns.tolist() + score_df.columns.tolist() + ["continuity_state","regime_id"]])
+
+    write_transition_log(conn, transition_log)
+    write_break_explanations(conn, break_expl)
+
+    conn.close()
+    st.caption(f"Persisted draws, continuity, transitions, and break explanations to SQLite: {db_path}")
