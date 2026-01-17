@@ -188,7 +188,7 @@ def compute_continuity_score(feat_df: pd.DataFrame, window: int = 30, z_threshol
     std_recent = X.rolling(window).std().replace(0, np.nan)
 
     diff = (mean_recent - mean_prior) / std_recent
-    score = np.sqrt(np.nansum(diff.values ** 2, axis=1))
+    score = np.sqrt(np.nansum(diff ** 2, axis=1))
     score_s = pd.Series(score, index=feat_df.index)
 
     mu = score_s.rolling(window).mean()
@@ -302,7 +302,3 @@ def render_continuity_page(df_raw: pd.DataFrame) -> None:
     tail_cols = ["draw_date"] + cols7 + ["overlap_prev","continuity_score","continuity_z","regime_break"]
     tail_cols = [c for c in tail_cols if c in df_out.columns]
     st.dataframe(df_out[tail_cols].tail(20).sort_values("draw_date", ascending=False), use_container_width=True)
-    #render continuity_page
-    def render_continuity_page(df_raw: pd.DataFrame) -> None:
-    st.header("Continuity Dashboard (Lotto 6/59 + Bonus)")
-    ...
