@@ -302,3 +302,13 @@ def render_continuity_page(df_raw: pd.DataFrame) -> None:
     tail_cols = ["draw_date"] + cols7 + ["overlap_prev","continuity_score","continuity_z","regime_break"]
     tail_cols = [c for c in tail_cols if c in df_out.columns]
     st.dataframe(df_out[tail_cols].tail(20).sort_values("draw_date", ascending=False), use_container_width=True)
+
+    # Download CSV
+    st.subheader("Download Analysis Results")
+    csv = df_out.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download full analysis as CSV",
+        data=csv,
+        file_name=f"lotto_analysis_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
