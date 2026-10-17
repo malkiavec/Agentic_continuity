@@ -11,6 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import sqlite3
 from typing import List
+from ai_assistant import render_ai_assistant
 
 # ----------------------------
 # SQLite persistence
@@ -504,6 +505,7 @@ def render_continuity_page(df_raw: pd.DataFrame) -> None:
     st.subheader("Current continuity mode")
     st.write(f"Current state: **{df_out.iloc[-1]['continuity_state']}**")
     st.write(f"Current regime_id: **{int(df_out.iloc[-1]['regime_id'])}**")
+    render_ai_assistant(df_out, transition_log, break_expl)
 
     # Persist
     if persist:
