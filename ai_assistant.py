@@ -105,6 +105,19 @@ def _request_assistant_reply(messages: list) -> str:
     if response.status_code == 401:
         raise RuntimeError("The configured AI key was rejected. Check the OPENAI_API_KEY secret.")
     if response.status_code == 429:
+        try:
+            provider_error = response.json().get("error", {})
+        except (TypeError, ValueError):
+            provider_error = {}
+        if (
+            provider_error.get("code") == "credit_balance_exhausted"
+            or provider_error.get("type") == "insufficient_quota"
+        ):
+            raise RuntimeError(
+                "The OpenAI API account has no credits remaining. Add API credits in the "
+                "OpenAI billing settings, then try again. ChatGPT subscriptions do not "
+                "include API credits."
+            )
         raise RuntimeError("The AI provider is rate-limiting requests or has reached its usage limit.")
     if response.status_code >= 500:
         raise RuntimeError("The AI provider is temporarily unavailable. Please try again shortly.")
